@@ -1,4 +1,4 @@
-# What
+# Research, papers, slides
 
 I've published various white papers and slide decks over the years. THis is where they will live out their days...
 
