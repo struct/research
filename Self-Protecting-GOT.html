@@ -1,0 +1,716 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
+<html><head>
+
+
+	<meta http-equiv="CONTENT-TYPE" content="text/html; charset=UTF-8">
+	<title></title>
+	<meta name="GENERATOR" content="OpenOffice.org 2.4  (Linux)">
+	<meta name="CREATED" content="0;0">
+	<meta name="CHANGEDBY" content="">
+	<meta name="CHANGED" content="20080824;17290000">
+	<style type="text/css">
+	<!--
+		P { font-family: "sans" }
+	-->
+	</style>
+</head><body dir="ltr" lang="en-US">
+<p align="center"><br><br>
+</p>
+<p align="center"><b>Self Protecting Global Offset Table
+(GOT)</b><br><br>http://em386.blogspot.com<br>24 August 2008<br>Draft
+Version 1.4</p>
+<p><b>Introduction</b><br><br>This paper describes a simple technique
+for Executable Linkable Format (ELF) objects to protect themselves
+from a potential exploitation technique of unknown vulnerabilities by
+marking specific pages read-only from user space virtual memory. This
+technique requires no kernel patching or third party programs. GOT
+protection already exists in the form of PT_RELRO marked program
+headers and can be achieved using the GNU Linker (<i>ld</i>) flag -z
+and the keyword '<i>relro</i>'. However sometimes these features may
+not be available on your target platform, and sometimes it may be
+worth exploring other ways to achieve them. That is the purpose of
+this paper, to explore another way to implement a read-only Global
+Offset Table. <br><br>It is assumed that the reader possesses some
+knowledge of C, ELF, binutils and the Linux operating system. All
+research was performed on a modern Ubuntu Linux 8.04 (Hardy Heron)
+operating system. Also it should be noted that this article mentions
+two different 'linkers'. One is the GNU linker (ld) which is
+generates ELF objects at compile time. The other is the dynamic
+linker (ld-linux) which is used at runtime.<br><br><b>Constructor
+Functions (ctors)</b><br><br>A constructor function in basic terms is
+a function that runs prior to another function. The term
+'constructors' is usually associated with C++ programs. Classes
+usually execute constructors upon the creation of a new instance.
+However generic constructors are entirely possible to implement in C
+using a GCC attribute: <br><br><i>__attribute__((constructor)) void
+foo_func()</i></p>
+<p><span style="font-style: normal;">The function </span><i>foo_func()</i><span style="font-style: normal;">
+will execute before </span><i>main()</i><br><br>We can test this with
+a simple program:</p>
+<pre><i># cat test.c</i>
+<i>__attribute__((constructor)) void foo_func()</i>
+<i>{</i>
+        <i>printf("Hello from foo_func\n");</i>
+<i>}</i>
+
+<i>int main()</i>
+<i>{</i>
+        <i>printf("Hello from main\n");</i>
+
+<i>return 0;</i>
+<i>}</i>
+
+<i># gcc -o test test.c</i>
+<i># ./test </i>
+<i>Hello from foo_func</i>
+<i>Hello from main</i></pre><p>
+You can read more about GCC attributes here
+<a href="http://www.ohse.de/uwe/articles/gcc-attributes.html">http://www.ohse.de/uwe/articles/gcc-attributes.html</a>.
+The technique covered in this paper occurs in a constructor function
+that is executed before <i>main()</i>. This allows our protection
+code to be added to preexisting code bases without any major
+modifications. <br><br>Despite our protection functions being
+executed before main() there are certain things in memory we simply
+cannot alter. If our protections become to invasive we run into
+runtime errors, which creates stability issues. Just like full kernel
+level protections such as PAX and Exec-Shield, we want to avoid
+disrupting program runtimes at all costs. <br><br><b>Runtime GOT PLT
+Protection</b><br><br>The GOT (Global Offset Table) is used by
+dynamically linked ELF objects. The ELF 1.2 specification states the
+following about the ELF relocation process:<br><br><i>"Relocation
+is the process of connecting symbolic references with symbolic
+definitions. For example, when a program calls a function, the
+associated call instruction must transfer control to the proper
+destination address at execution. In other words, relocatable files
+must have information that describes how to modify their section
+contents, thus allowing executable and shared object files to hold
+the right information for a process's program image. Relocation
+entries are these data."</i><br><br>If you want to read more
+about dynamic ELF relocation I have written a decent overview on my
+<a href="http://em386.blogspot.com/2006/10/resolving-elf-relocation-name-symbols.html">blog</a>.
+<br><br>By default on modern Linux systems relocation is done the
+lazy way (RTLD_LAZY) by the dynamic linker (ld-linux). What this
+means is a function's location is only looked up when that function
+is first called. Every function in a loaded shared library that the
+program calls has a GOT entry. The default location in the GOT will
+point to the dynamic linker itself until the function is called, then
+the GOT is rewritten with the actual location of the function. This
+is mainly for performance reasons. However the dynamic linker can be
+forced to lookup the absolute location of all functions when the
+program is first executed. The way to force this is using the
+environment variable LD_BIND_NOW. Setting it to a non NULL value will
+force the dynamic linker to lookup all function locations immediately
+after all shared libraries are loaded and fill in the GOT with the
+correct values.<br><br>The GOT is an easy target for exploit writers.
+When an arbitrary 4 byte overwrite is possible anywhere in memory an
+attacker can overwrite a pointer in the GOT for a function that has
+not yet been executed, such as <i>exit()</i>. When the program
+finally calls <i>exit()</i> it's PLT entry will reference it's offset
+in the GOT and use its value as the location of the <i>exit()</i>
+function. This is usually overwritten with an attacker supplied
+function such as <i>system()</i> or an indirect execution of
+shellcode. <br><br>The first implementation of self GOT protection
+comes in the form of a special constructor function that checks for
+the LD_BIND_NOW environment variable, locates it's own GOT in memory
+and marks the memory segment read-only. My first implementation did
+not work too well for various reasons. For one I was not controlling
+the location of the GOT, I was simply allowing GCC to compile my test
+program and place its ELF object data to their default location. This
+presented several problems. For one, calling <i>mprotect()</i> on non
+page-aligned locations was failing. It was simply not feasible to
+<i>mprotect()</i> the ELF base and beyond just to protect the GOT.
+There are plenty of other memory segments adjacent to the GOT that
+MUST be writable such as the .bss segment. So the first problem
+becomes quite clear. If we want to <i>mprotect()</i> the GOT, or any
+other sensitive memory segments, then we have to group them near a
+page aligned boundary separate from other segments that must remain
+writable. Of course like anything else, there is the easy way to do
+this and the hard way. The hard way consists of rewriting the binary,
+which is necessary for closed source applications, this has the
+potential to be messy which means we may interfere with our
+application. The easy way is to use a GNU linker script to tell the
+linker how to setup our sections at compile time. This is of course
+the preferred method. <br><br>The GNU linker (ld) has its own
+interpreted scripting language. This language is used to write linker
+files that tell the linker how to create the final object file. To
+view the default linker script type the following: 
+</p>
+<pre><i># ld --verbose</i>
+<i>GNU ld (GNU Binutils for Ubuntu) 2.18.0.20080103</i>
+  <i>Supported emulations:</i>
+   <i>elf_i386</i>
+   <i>i386linux</i>
+   <i>elf_x86_64</i>
+<i>using internal linker script:</i>
+<i>==================================================</i>
+<i>/* Script for -z combreloc: combine and sort reloc sections */</i>
+<i>OUTPUT_FORMAT("elf32-i386", "elf32-i386",</i>
+              <i>"elf32-i386")</i>
+<i>OUTPUT_ARCH(i386)</i>
+<i>...(output cropped)...</i></pre><p>
+For additional linker scripts, most Linux distributions store them in
+<i>/usr/lib/ldscripts</i>. The default script is around 197 lines
+long. Most open source projects use the default linker script, as it
+generates a binary with a common layout. In order to make our self
+GOT protection technique work we are going to have to create a custom
+linker script. One which places sensitive areas of memory where we
+want them to be. Preferably on page aligned boundaries so that
+<i>mprotect()</i> can be used. <br><br>Let's take a quick look at the
+typical layout of ELF object data in an example program: 
+</p>
+<pre><i># cat test-prog.c</i>
+<i>#include &lt; stdio.h&gt;</i>
+<i>#include &lt; stdlib.h&gt;</i>
+<i>#include &lt; string.h&gt;</i>
+
+<i>char global_var[256];</i>
+
+<i>int main(int argc, char *argv[])</i>
+<i>{</i>
+    <i>char *ptr = NULL;</i>
+    <i>char buffer[128];</i>
+
+    <i>ptr = buffer;</i>
+
+    <i>if(argc == 3)</i>
+    <i>{</i>
+        <i>strcpy(ptr, argv[1]);   </i>
+        <i>printf("Copied buffer: [%s]\n", buffer);</i>
+        <i>strcpy(ptr, argv[1]);</i>
+
+        <i>strncpy(global_var, argv[2], 255);  </i>
+        <i>printf("Copied into global_var: [%s]\n", global_var);</i>
+    <i>}</i>
+
+<i>return 0;</i>
+<i>}</i>
+
+<i># gcc -o test-prog test-prog.c</i>
+<i># readelf -Sl test-prog</i>
+<i>There are 36 section headers, starting at offset 0xe64:</i>
+
+<i>Section Headers:</i>
+  <i>[Nr] Name              Type            Addr     Off    Size   ES Flg Lk Inf Al</i>
+  <i>[ 0]                   NULL            00000000 000000 000000 00      0   0  0</i>
+  <i>[ 1] .interp           PROGBITS        08048114 000114 000013 00   A  0   0  1</i>
+  <i>[ 2] .note.ABI-tag     NOTE            08048128 000128 000020 00   A  0   0  4</i>
+  <i>[ 3] .hash             HASH            08048148 000148 000034 04   A  5   0  4</i>
+  <i>[ 4] .gnu.hash         GNU_HASH        0804817c 00017c 000020 04   A  5   0  4</i>
+  <i>[ 5] .dynsym           DYNSYM          0804819c 00019c 000080 10   A  6   1  4</i>
+  <i>[ 6] .dynstr           STRTAB          0804821c 00021c 000076 00   A  0   0  1</i>
+  <i>[ 7] .gnu.version      VERSYM          08048292 000292 000010 02   A  5   0  2</i>
+  <i>[ 8] .gnu.version_r    VERNEED         080482a4 0002a4 000030 00   A  6   1  4</i>
+  <i>[ 9] .rel.dyn          REL             080482d4 0002d4 000008 08   A  5   0  4</i>
+  <i>[10] .rel.plt          REL             080482dc 0002dc 000030 08   A  5  12  4</i>
+  <i>[11] .init             PROGBITS        0804830c 00030c 000030 00  AX  0   0  4</i>
+  <i>[12] .plt              PROGBITS        0804833c 00033c 000070 04  AX  0   0  4</i>
+  <i>[13] .text             PROGBITS        080483b0 0003b0 00022c 00  AX  0   0 16</i>
+  <i>[14] .fini             PROGBITS        080485dc 0005dc 00001c 00  AX  0   0  4</i>
+  <i>[15] .rodata           PROGBITS        080485f8 0005f8 00003b 00   A  0   0  4</i>
+  <i>[16] .eh_frame         PROGBITS        08048634 000634 000004 00   A  0   0  4</i>
+  <i>[17] .ctors            PROGBITS        08049638 000638 000008 00  WA  0   0  4</i>
+  <i>[18] .dtors            PROGBITS        08049640 000640 000008 00  WA  0   0  4</i>
+  <i>[19] .jcr              PROGBITS        08049648 000648 000004 00  WA  0   0  4</i>
+  <i>[20] .dynamic          DYNAMIC         0804964c 00064c 0000d0 08  WA  6   0  4</i>
+  <i>[21] .got              PROGBITS        0804971c 00071c 000004 04  WA  0   0  4</i>
+  <i>[22] .got.plt          PROGBITS        08049720 000720 000024 04  WA  0   0  4</i>
+  <i>[23] .data             PROGBITS        08049744 000744 00000c 00  WA  0   0  4</i>
+  <i>[24] .bss              NOBITS          08049760 000750 000120 00  WA  0   0 32</i>
+  <i>[25] .comment          PROGBITS        00000000 000750 000126 00      0   0  1</i>
+  <i>[26] .debug_aranges    PROGBITS        00000000 000878 000050 00      0   0  8</i>
+  <i>[27] .debug_pubnames   PROGBITS        00000000 0008c8 000025 00      0   0  1</i>
+  <i>[28] .debug_info       PROGBITS        00000000 0008ed 0001a7 00      0   0  1</i>
+  <i>[29] .debug_abbrev     PROGBITS        00000000 000a94 00006f 00      0   0  1</i>
+  <i>[30] .debug_line       PROGBITS        00000000 000b03 000129 00      0   0  1</i>
+  <i>[31] .debug_str        PROGBITS        00000000 000c2c 0000bb 01  MS  0   0  1</i>
+  <i>[32] .debug_ranges     PROGBITS        00000000 000ce8 000040 00      0   0  8</i>
+  <i>[33] .shstrtab         STRTAB          00000000 000d28 000139 00      0   0  1</i>
+  <i>[34] .symtab           SYMTAB          00000000 001404 0004e0 10     35  55  4</i>
+  <i>[35] .strtab           STRTAB          00000000 0018e4 000250 00      0   0  1</i>
+<i>Key to Flags:</i>
+  <i>W (write), A (alloc), X (execute), M (merge), S (strings)</i>
+  <i>I (info), L (link order), G (group), x (unknown)</i>
+  <i>O (extra OS processing required) o (OS specific), p (processor specific)</i>
+
+<i>Elf file type is EXEC (Executable file)</i>
+<i>Entry point 0x80483b0</i>
+<i>There are 7 program headers, starting at offset 52</i>
+
+<i>Program Headers:</i>
+  <i>Type           Offset   VirtAddr   PhysAddr   FileSiz MemSiz  Flg Align</i>
+  <i>PHDR           0x000034 0x08048034 0x08048034 0x000e0 0x000e0 R E 0x4</i>
+  <i>INTERP         0x000114 0x08048114 0x08048114 0x00013 0x00013 R   0x1</i>
+      <i>[Requesting program interpreter: /lib/ld-linux.so.2]</i>
+  <i>LOAD           0x000000 0x08048000 0x08048000 0x00638 0x00638 R E 0x1000</i>
+  <i>LOAD           0x000638 0x08049638 0x08049638 0x00118 0x00248 RW  0x1000</i>
+  <i>DYNAMIC        0x00064c 0x0804964c 0x0804964c 0x000d0 0x000d0 RW  0x4</i>
+  <i>NOTE           0x000128 0x08048128 0x08048128 0x00020 0x00020 R   0x4</i>
+  <i>GNU_STACK      0x000000 0x00000000 0x00000000 0x00000 0x00000 RW  0x4</i>
+
+ <i>Section to Segment mapping:</i>
+  <i>Segment Sections...</i>
+   <i>00     </i>
+   <i>01     .interp </i>
+   <i>02     .interp .note.ABI-tag .hash .gnu.hash .dynsym .dynstr .gnu.version .gnu.version_r .rel.dyn .rel.plt .init .plt .text .fini .rodata .eh_frame </i>
+   <i>03     .ctors .dtors .jcr .dynamic .got .got.plt .data .bss </i>
+   <i>04     .dynamic </i>
+   <i>05     .note.ABI-tag </i>
+   <i>06     </i></pre><p>
+The section header has its own permission markings such as W for
+write, A for allocate, X for execute and more. However these are
+inconsequential to the program once its in memory. The ELF program
+header and its correlation to the section header is what we need to
+look at. The process of our protection technique is to make sure the
+dynamic linker has resolved all function locations at process
+creation and then mark the GOT read only. As stated before this is
+not possible yet because the GOT (.got.plt in our example) appears to
+be on the same page as the .bss and other important sections that
+must be writable. So we must use our linker script to control where
+the GOT is placed. Use the following command to pipe the ld default
+script to a text file. 
+</p>
+<pre style="margin-bottom: 0.2in;"><i># ld --verbose &gt; ld.txt</i></pre><p>
+Now we want to edit this file. Make sure to strip all contents above
+the '===' dashed line, these are just comments. You also want to
+remove the trailing '===' line from the file. Now around line 136 you
+should see the '.got' and '.got.plt' sections. We want to change a
+few lines here that tells the GNU linker where to place the sections.
+The following patch accomplishes this by telling the linker to place
+the .got and .got.plt at least one MAXPAGESIZE beyond the .bss
+section. 
+</p>
+<pre><i>--- ../testing/ld.txt   2008-05-02 10:20:21.000000000 -0400</i>
+<i>+++ ../testing/new.txt  2008-05-02 14:26:29.000000000 -0400</i>
+<i>@@ -133,9 +133,6 @@</i>
+   <i>.jcr            : { KEEP (*(.jcr)) }</i>
+   <i>.data.rel.ro : { *(.data.rel.ro.local* .gnu.linkonce.d.rel.ro.local.*) *(.data.rel.ro* .gnu.linkonce.d.rel.ro.*) }</i>
+   <i>.dynamic        : { *(.dynamic) }</i>
+<i>-  .got            : { *(.got) }</i>
+<i>-  . = DATA_SEGMENT_RELRO_END (12, .);</i>
+<i>-  .got.plt        : { *(.got.plt) }</i>
+   <i>.data           :</i>
+   <i>{</i>
+     <i>*(.data .data.* .gnu.linkonce.d.*)</i>
+<i>@@ -159,6 +156,9 @@</i>
+   <i>}</i>
+   <i>. = ALIGN(32 / 8);</i>
+   <i>. = ALIGN(32 / 8);</i>
+<i>+  .got ALIGN(CONSTANT(MAXPAGESIZE))           : { *(.got) }    /* SPG Align the .got at least one page beyond .bss */</i>
+<i>+  . = DATA_SEGMENT_RELRO_END (12, .);</i>
+<i>+  .got.plt        : { *(.got.plt) }</i>
+   <i>_end = .; PROVIDE (end = .);</i>
+   <i>. = DATA_SEGMENT_END (.);</i>
+   <i>/* Stabs debugging sections.  */</i></pre><p>
+Notice the extra 'ALIGN(CONSTANT(MAXPAGESIZE))' expression, this pads
+our sections at least one page beyond the end of the .bss section.
+Now we compile, make sure the sections are placed correctly and test
+the program. You can tell the GNU linker to use a different linker
+script by using the gcc command line flags '-Wl,-T new.txt' where
+new.txt is your modified linker script.</p>
+<pre><i># gcc -o test-prog test-prog.c -DSPG_DEBUG -Wl,-T new.txt </i>
+<i># readelf -lS test-prog</i>
+<i>There are 36 section headers, starting at offset 0x273c:</i>
+
+<i>Section Headers:</i>
+  <i>[Nr] Name              Type            Addr     Off    Size   ES Flg Lk Inf Al</i>
+  <i>[ 0]                   NULL            00000000 000000 000000 00      0   0  0</i>
+  <i>[ 1] .interp           PROGBITS        08048134 000134 000013 00   A  0   0  1</i>
+  <i>[ 2] .note.ABI-tag     NOTE            08048148 000148 000020 00   A  0   0  4</i>
+  <i>[ 3] .hash             HASH            08048168 000168 000034 04   A  5   0  4</i>
+  <i>[ 4] .gnu.hash         GNU_HASH        0804819c 00019c 000020 04   A  5   0  4</i>
+  <i>[ 5] .dynsym           DYNSYM          080481bc 0001bc 000080 10   A  6   1  4</i>
+  <i>[ 6] .dynstr           STRTAB          0804823c 00023c 000076 00   A  0   0  1</i>
+  <i>[ 7] .gnu.version      VERSYM          080482b2 0002b2 000010 02   A  5   0  2</i>
+  <i>[ 8] .gnu.version_r    VERNEED         080482c4 0002c4 000030 00   A  6   1  4</i>
+  <i>[ 9] .rel.dyn          REL             080482f4 0002f4 000008 08   A  5   0  4</i>
+  <i>[10] .rel.plt          REL             080482fc 0002fc 000030 08   A  5  12  4</i>
+  <i>[11] .init             PROGBITS        0804832c 00032c 000030 00  AX  0   0  4</i>
+  <i>[12] .plt              PROGBITS        0804835c 00035c 000070 04  AX  0   0  4</i>
+  <i>[13] .text             PROGBITS        080483d0 0003d0 00022c 00  AX  0   0 16</i>
+  <i>[14] .fini             PROGBITS        080485fc 0005fc 00001c 00  AX  0   0  4</i>
+  <i>[15] .rodata           PROGBITS        08048618 000618 00003b 00   A  0   0  4</i>
+  <i>[16] .eh_frame         PROGBITS        08048654 000654 000004 00   A  0   0  4</i>
+  <i>[17] .ctors            PROGBITS        08049000 001000 000008 00  WA  0   0  4</i>
+  <i>[18] .dtors            PROGBITS        08049008 001008 000008 00  WA  0   0  4</i>
+  <i>[19] .jcr              PROGBITS        08049010 001010 000004 00  WA  0   0  4</i>
+  <i>[20] .dynamic          DYNAMIC         08049014 001014 0000d0 08  WA  6   0  4</i>
+  <i>[21] .data             PROGBITS        080490e4 0010e4 00000c 00  WA  0   0  4</i>
+  <i>[22] .bss              NOBITS          08049100 0010f0 000120 00  WA  0   0 32</i>
+  <i>[23] .got              PROGBITS        0804a000 002000 000004 04  WA  0   0  4</i>
+  <i>[24] .got.plt          PROGBITS        0804a004 002004 000024 04  WA  0   0  4</i>
+  <i>[25] .comment          PROGBITS        00000000 002028 000126 00      0   0  1</i>
+  <i>[26] .debug_aranges    PROGBITS        00000000 002150 000050 00      0   0  8</i>
+  <i>[27] .debug_pubnames   PROGBITS        00000000 0021a0 000025 00      0   0  1</i>
+  <i>[28] .debug_info       PROGBITS        00000000 0021c5 0001a7 00      0   0  1</i>
+  <i>[29] .debug_abbrev     PROGBITS        00000000 00236c 00006f 00      0   0  1</i>
+  <i>[30] .debug_line       PROGBITS        00000000 0023db 000129 00      0   0  1</i>
+  <i>[31] .debug_str        PROGBITS        00000000 002504 0000bb 01  MS  0   0  1</i>
+  <i>[32] .debug_ranges     PROGBITS        00000000 0025c0 000040 00      0   0  8</i>
+  <i>[33] .shstrtab         STRTAB          00000000 002600 000139 00      0   0  1</i>
+  <i>[34] .symtab           SYMTAB          00000000 002cdc 0004e0 10     35  55  4</i>
+  <i>[35] .strtab           STRTAB          00000000 0031bc 000258 00      0   0  1</i>
+<i>Key to Flags:</i>
+  <i>W (write), A (alloc), X (execute), M (merge), S (strings)</i>
+  <i>I (info), L (link order), G (group), x (unknown)</i>
+  <i>O (extra OS processing required) o (OS specific), p (processor specific)</i>
+
+<i>Elf file type is EXEC (Executable file)</i>
+<i>Entry point 0x80483d0</i>
+<i>There are 8 program headers, starting at offset 52</i>
+
+<i>Program Headers:</i>
+  <i>Type           Offset   VirtAddr   PhysAddr   FileSiz MemSiz  Flg Align</i>
+  <i>PHDR           0x000034 0x08048034 0x08048034 0x00100 0x00100 R E 0x4</i>
+  <i>INTERP         0x000134 0x08048134 0x08048134 0x00013 0x00013 R   0x1</i>
+      <i>[Requesting program interpreter: /lib/ld-linux.so.2]</i>
+  <i>LOAD           0x000000 0x08048000 0x08048000 0x00658 0x00658 R E 0x1000</i>
+  <i>LOAD           0x001000 0x08049000 0x08049000 0x000f0 0x00220 RW  0x1000</i>
+  <i>LOAD           0x002000 0x0804a000 0x0804a000 0x00028 0x00028 RW  0x1000</i>
+  <i>DYNAMIC        0x001014 0x08049014 0x08049014 0x000d0 0x000d0 RW  0x4</i>
+  <i>NOTE           0x000148 0x08048148 0x08048148 0x00020 0x00020 R   0x4</i>
+  <i>GNU_STACK      0x000000 0x00000000 0x00000000 0x00000 0x00000 RW  0x4</i>
+
+ <i>Section to Segment mapping:</i>
+  <i>Segment Sections...</i>
+   <i>00     </i>
+   <i>01     .interp </i>
+   <i>02     .interp .note.ABI-tag .hash .gnu.hash .dynsym .dynstr .gnu.version .gnu.version_r .rel.dyn .rel.plt .init .plt .text .fini .rodata .eh_frame </i>
+   <i>03     .ctors .dtors .jcr .dynamic .data .bss </i>
+   <i>04     .got .got.plt </i>
+   <i>05     .dynamic </i>
+   <i>06     .note.ABI-tag </i>
+   <i>07    </i>
+ 
+<i># ./test-prog Hello World</i>
+<i>Copied buffer: [Hello]</i>
+<i>Copied into global_var: [World]</i></pre><p>
+Notice the .got and .got.plt sections are placed appropriately.
+However we still have a problem here, they are still marked RW. This
+is where we need to get creative with our constructor function. Our
+constructor function has to be able to locate its own GOT in memory
+and <i>mprotect()</i> it read-only. The simplest way is by locating
+its own ELF header in memory, locating the program header for the
+PT_DYNAMIC segment and using it to find the dynamic DT_PLTGOT entry.
+This entry gives us our .got.plt location. Using a simple (but
+hackish) AND-bitmask we can grab the address the page the .got.plt
+starts on and <i>mprotect()</i> it accordingly. My constructor
+function plus the example code is below and commented in detail. 
+</p>
+<pre><i># cat got-spg.c</i>
+<i>#include &lt; stdio.h&gt;</i>
+<i>#include &lt; stdlib.h&gt;</i>
+<i>#include &lt; string.h&gt;</i>
+<i>#include &lt; unistd.h&gt;</i>
+<i>#include &lt; elf.h&gt;</i>
+<i>#include &lt; errno.h&gt;</i>
+<i>#include &lt; sys/mman.h&gt;</i>
+
+<i>/* gcc -o got-spg got-spg.c -DSPG_DEBUG -Wl,-T new.txt */</i>
+
+<i>#define ERR  -1</i>
+
+<i>__attribute__((constructor)) void __self_protect_got()</i>
+<i>{</i>
+
+<i>int i;</i>
+<i>int ret;</i>
+<i>int loc = 0;</i>
+
+<i>#ifdef SPG_DEBUG</i>
+        <i>fprintf(stdout, "\nSelf Protecting GOT\n\n");</i>
+<i>#endif</i>
+
+<i>/* Check if ld has the right env settings - RTLD_LAZY means we cant touch the GOT */</i>
+<i>char *lazy = getenv("LD_BIND_NOW");</i>
+
+        <i>if(lazy == NULL)</i>
+        <i>{</i>
+                <i>#ifdef SPG_DEBUG</i>
+                        <i>fprintf(stdout, "\nSkipping self protection...\nPlease set LD_BIND_NOW=1 and retry\n\n");</i>
+                <i>#endif</i>
+
+                <i>return;</i>
+        <i>}</i>
+
+<i>/* Get the page size, 4096 on x86 */</i>
+<i>int     pagesize = sysconf(_SC_PAGE_SIZE);</i>
+
+        <i>if(pagesize == ERR)</i>
+        <i>{</i>
+                <i>#ifdef SPG_DEBUG</i>
+                        <i>fprintf(stdout, "sysconf() failed, assuming 4096 byte page size (x86 default)\n");</i>
+                <i>#endif</i>
+
+                <i>pagesize = 4096;</i>
+        <i>}</i>
+        <i>else</i>
+        <i>{</i>
+                <i>#ifdef SPG_DEBUG</i>
+                        <i>fprintf(stdout, "Pagesize = %d\n", pagesize);</i>
+                <i>#endif</i>
+        <i>}</i>
+
+<i>/* Locate the ELF base address. This is the only hard coded address in the whole function */</i>
+<i>char *base_ptr = (char *) 0x8048000;</i>
+
+    <i>/* Randomizing the ELF base address means we may have to search for it */</i>
+    <i>while(*base_ptr != 'E' &amp;&amp; *base_ptr+1 != 'L' &amp;&amp; *base_ptr+2 != 'F')</i>
+    <i>{</i>
+        <i>*base_ptr++;</i>
+    <i>}</i>
+
+    <i>*base_ptr--;</i>
+
+<i>Elf32_Ehdr *elf_header = (Elf32_Ehdr *) base_ptr; /* Elf Header */</i>
+<i>Elf32_Phdr *phdr;               /* ELF program header */</i>
+<i>Elf32_Phdr *dyn_phdr = NULL;    /* Program header marked 'dynamic' */</i>
+<i>Elf32_Dyn *dyn;                 /* Specific dynamic segment entry for .got.plt */</i>
+
+        <i>/* Iterate the program header for the dynamic segment */</i>
+        <i>for(i=0;i &lt; elf_header-&gt;e_phnum; i++)</i>
+        <i>{</i>
+                <i>phdr = (Elf32_Phdr *)(base_ptr + elf_header-&gt;e_phoff + (i * elf_header-&gt;e_phentsize));</i>
+
+                <i>if(phdr-&gt;p_type == PT_DYNAMIC)</i>
+                <i>{</i>
+                        <i>dyn_phdr = phdr;</i>
+                        <i>break;</i>
+                <i>}</i>
+        <i>}</i>
+
+        <i>if(dyn_phdr == NULL)</i>
+        <i>{</i>
+                <i>#ifdef SPG_DEBUG</i>
+                        <i>fprintf(stdout, "Could not locate the dynamic segment\n\n");</i>
+                <i>#endif</i>
+
+                <i>return;</i>
+        <i>}</i>
+
+        <i>/* Iterate through the dynamic segment for an entry of type DT_PLTGOT */</i>
+        <i>for(i=0;i &lt; dyn_phdr-&gt;p_filesz / sizeof(Elf32_Dyn); i++)</i>
+        <i>{</i>
+                <i>dyn = (Elf32_Dyn *)(base_ptr + dyn_phdr-&gt;p_offset + (i * sizeof(Elf32_Dyn)));</i>
+
+                <i>/* Once its found, save the location of our .got.plt */</i>
+                <i>if(dyn-&gt;d_tag == DT_PLTGOT)</i>
+                <i>{</i>
+                        <i>#ifdef SPG_DEBUG</i>
+                                <i>fprintf(stdout, "GOTPLT Located @ %x\n", dyn-&gt;d_un.d_val);</i>
+                        <i>#endif</i>
+
+                        <i>loc = dyn-&gt;d_un.d_val;</i>
+                        <i>break;</i>
+                <i>}</i>
+        <i>}</i>
+
+        <i>/* We can't do anything without an address for the GOT */</i>
+        <i>if(loc == 0)</i>
+        <i>{</i>
+                <i>#ifdef SPG_DEBUG</i>
+                        <i>fprintf(stdout, "GOTPLT not located\n\n");</i>
+                <i>#endif</i>
+
+                <i>return;</i>
+        <i>}</i>
+
+        <i>/* AND-bitmask would turn 0x804b004 into 0x804b000, which is our page aligned addr */</i>
+        <i>loc = (loc &amp; 0xffff000);</i>
+
+        <i>#ifdef SPG_DEBUG</i>
+                <i>fprintf(stdout, "Protecting page found at %x\n", loc);</i>
+        <i>#endif</i>
+
+        <i>/* Set the entire page READ-ONLY */</i>
+        <i>ret = mprotect((void *) loc, pagesize, PROT_READ);</i>
+
+        <i>if(ret != ERR)</i>
+        <i>{</i>
+                <i>#ifdef SPG_DEBUG</i>
+                        <i>fprintf(stdout, "GOT segment now protected for process [%d]...\n\n", getpid());</i>
+                <i>#endif</i>
+        <i>}</i>
+        <i>else</i>
+        <i>{</i>
+                <i>#ifdef SPG_DEBUG</i>
+                        <i>perror("mprotect");</i>
+                        <i>fprintf(stdout, "\n\n");</i>
+                <i>#endif</i>
+        <i>}</i>
+
+<i>return;</i>
+<i>}</i>
+
+<i>/* Main Program */</i>
+
+<i>char global_var[256];</i>
+
+<i>int main(int argc, char *argv[])</i>
+<i>{</i>
+        <i>char *ptr;</i>
+        <i>char buffer[128];</i>
+
+        <i>ptr = buffer;</i>
+
+    <i>if(argc == 3)</i>
+    <i>{</i>
+        <i>strcpy(ptr, argv[1]);   /* A segfault would happen here if strcpy</i>
+                                <i>was not already present in the GOT */</i>
+        <i>printf("Copied buffer: [%s]\n", buffer);</i>
+        <i>strcpy(ptr, argv[1]);</i>
+
+        <i>strncpy(global_var, argv[2], 255);  /* Simply to test global data is still OK */</i>
+        <i>printf("Copied into global_var: [%s]\n", global_var);</i>
+    <i>}</i>
+
+        <i>/* This is so we can grab the PID and print /proc/(pid)/maps to check if it worked */</i>
+        <i>sleep(35);</i>
+
+<i>return 0;</i>
+<i>}</i>
+
+<i># gcc -o got-spg got-spg.c -DSPG_DEBUG -Wl,-T new.txt </i>
+<i># ./got-spg Hello World</i>
+
+<i>Self Protecting GOT</i>
+<i>Pagesize = 4096</i>
+<i>GOTPLT Located @ 804a004</i>
+<i>Protecting page found at 804a000</i>
+<i>GOT segment now protected for process [16722]...</i>
+
+<i>Copied buffer: [Hello]</i>
+<i>Copied into global_var: [World]</i>
+
+<i>...(in another terminal)...</i>
+
+<i># cat /proc/16722/maps</i>
+<i>08048000-08049000 r-xp 00000000 07:00 147464     /testing/got-spg</i>
+<i>08049000-0804a000 rw-p 00001000 07:00 147464     /testing/SPG/got-spg</i>
+<font color="#ff0000"><i>0804a000-0804b000 <b>r--p</b> 00002000 07:00 147464     /testing/SPG/got-spg</i></font>
+<i>b7e0f000-b7e10000 rw-p b7e0f000 00:00 0 </i>
+<i>b7e10000-b7f59000 r-xp 00000000 08:02 6214306    /lib/tls/i686/cmov/libc-2.7.so</i>
+<i>b7f59000-b7f5a000 r--p 00149000 08:02 6214306    /lib/tls/i686/cmov/libc-2.7.so</i>
+<i>b7f5a000-b7f5c000 rw-p 0014a000 08:02 6214306    /lib/tls/i686/cmov/libc-2.7.so</i>
+<i>b7f5c000-b7f5f000 rw-p b7f5c000 00:00 0 </i>
+<i>b7f73000-b7f76000 rw-p b7f73000 00:00 0 </i>
+<i>b7f76000-b7f77000 r-xp b7f76000 00:00 0          [vdso]</i>
+<i>b7f77000-b7f91000 r-xp 00000000 08:02 6213883    /lib/ld-2.7.so</i>
+<i>b7f91000-b7f93000 rw-p 00019000 08:02 6213883    /lib/ld-2.7.so</i>
+<i>bf961000-bf976000 rw-p bffeb000 00:00 0          [stack]</i></pre><p>
+Our process map above shows the page we marked read-only is being
+enforced properly. If an attacker tried to write a pointer value to
+the GOT during an exploitation attempt it would fail. <br><br><b>Other
+Protections</b> <br><br>So now we have protected our own .got.plt
+from being written to by attackers. But what other parts of memory
+can we protect? The .dtors section seems like a good target. And all
+we need to do is move its location in the linker script below .got
+and .got.plt. What about .rodata? .jcr? ctors? data.rel.ro? Below is
+a patch to the default linker script to move these sections.</p>
+<pre><i>--- ld.txt      2008-05-02 10:20:21.000000000 -0400</i>
+<i>+++ new.txt     2008-05-03 00:57:52.000000000 -0400</i>
+<i>@@ -101,6 +101,33 @@</i>
+     <i>KEEP (*(SORT(.fini_array.*)))</i>
+     <i>PROVIDE_HIDDEN (__fini_array_end = .);</i>
+   <i>}</i>
+<i>+  .dynamic        : { *(.dynamic) }</i>
+<i>+  .data           :</i>
+<i>+  {</i>
+<i>+    *(.data .data.* .gnu.linkonce.d.*)</i>
+<i>+    KEEP (*(.gnu.linkonce.d.*personality*))</i>
+<i>+    SORT(CONSTRUCTORS)</i>
+<i>+  }</i>
+<i>+  .data1          : { *(.data1) }</i>
+<i>+  _edata = .; PROVIDE (edata = .);</i>
+<i>+  __bss_start = .;</i>
+<i>+  .bss            :</i>
+<i>+  {</i>
+<i>+   *(.dynbss)</i>
+<i>+   *(.bss .bss.* .gnu.linkonce.b.*)</i>
+<i>+   *(COMMON)</i>
+<i>+   /* Align here to ensure that the .bss section occupies space up to</i>
+<i>+      _end.  Align after .bss to ensure correct alignment even if the</i>
+<i>+      .bss section disappears because there are no input sections.</i>
+<i>+      FIXME: Why do we need it? When there is no .bss section, we don't</i>
+<i>+      pad the .data section.  */</i>
+<i>+   . = ALIGN(. != 0 ? 32 / 8 : 1);</i>
+<i>+  }</i>
+<i>+  . = ALIGN(32 / 8);</i>
+<i>+  . = ALIGN(32 / 8);</i>
+<i>+  .got ALIGN(CONSTANT(MAXPAGESIZE))           : { *(.got) }</i>
+<i>+  . = DATA_SEGMENT_RELRO_END (12, .);</i>
+<i>+  .got.plt        : { *(.got.plt) }</i>
+   <i>.ctors          :</i>
+   <i>{</i>
+     <i>/* gcc uses crtbegin.o to find the start of</i>
+<i>@@ -132,33 +159,6 @@</i>
+   <i>}</i>
+   <i>.jcr            : { KEEP (*(.jcr)) }</i>
+   <i>.data.rel.ro : { *(.data.rel.ro.local* .gnu.linkonce.d.rel.ro.local.*) *(.data.rel.ro* .gnu.linkonce.d.rel.ro.*) }</i>
+<i>-  .dynamic        : { *(.dynamic) }</i>
+<i>-  .got            : { *(.got) }</i>
+<i>-  . = DATA_SEGMENT_RELRO_END (12, .);</i>
+<i>-  .got.plt        : { *(.got.plt) }</i>
+<i>-  .data           :</i>
+<i>-  {</i>
+<i>-    *(.data .data.* .gnu.linkonce.d.*)</i>
+<i>-    KEEP (*(.gnu.linkonce.d.*personality*))</i>
+<i>-    SORT(CONSTRUCTORS)</i>
+<i>-  }</i>
+<i>-  .data1          : { *(.data1) }</i>
+<i>-  _edata = .; PROVIDE (edata = .);</i>
+<i>-  __bss_start = .;</i>
+<i>-  .bss            :</i>
+<i>-  {</i>
+<i>-   *(.dynbss)</i>
+<i>-   *(.bss .bss.* .gnu.linkonce.b.*)</i>
+<i>-   *(COMMON)</i>
+<i>-   /* Align here to ensure that the .bss section occupies space up to</i>
+<i>-      _end.  Align after .bss to ensure correct alignment even if the</i>
+<i>-      .bss section disappears because there are no input sections.</i>
+<i>-      FIXME: Why do we need it? When there is no .bss section, we don't</i>
+<i>-      pad the .data section.  */</i>
+<i>-   . = ALIGN(. != 0 ? 32 / 8 : 1);</i>
+<i>-  }</i>
+<i>-  . = ALIGN(32 / 8);</i>
+<i>-  . = ALIGN(32 / 8);</i>
+   <i>_end = .; PROVIDE (end = .);</i>
+   <i>. = DATA_SEGMENT_END (.);</i>
+   <i>/* Stabs debugging sections.  */</i></pre><p>
+<br><b>Conclusion</b> <br><br>We can easily turn our constructor
+function into a simple library that can be linked into any program. I
+tested the GOT protection technique on Snort IDS version 2.8.1. Below
+is the output of its ELF section header and its memory mapping.</p>
+<pre><i># readelf -lS /usr/src/snort-2.8.1/src/snort</i>
+<i>...</i>
+  <i>[17] .dynamic          DYNAMIC         080e9000 0a1000 0000f8 08  WA  6   0  4</i>
+  <i>[18] .data             PROGBITS        080e9100 0a1100 582668 00  WA  0   0 32</i>
+  <i>[19] .bss              NOBITS          0866b780 623768 5c68bc 00  WA  0   0 32</i>
+  <i>[20] .got              PROGBITS        08c33000 624000 000004 04  WA  0   0  4</i>
+  <i>[21] .got.plt          PROGBITS        08c33004 624004 000280 04  WA  0   0  4</i>
+  <i>[22] .ctors            PROGBITS        08c33284 624284 00000c 00  WA  0   0  4</i>
+  <i>[23] .dtors            PROGBITS        08c33290 624290 000008 00  WA  0   0  4</i>
+  <i>[24] .jcr              PROGBITS        08c33298 624298 000004 00  WA  0   0  4</i>
+<i>...</i>
+<i># cat /proc/`pidof snort`/maps</i>
+<i>08048000-080e9000 r-xp 00000000 08:02 4891501    /usr/src/snort-2.8.1/src/snort</i>
+<i>080e9000-0866c000 rw-p 000a1000 08:02 4891501    /usr/src/snort-2.8.1/src/snort</i>
+<i>0866c000-08c33000 rw-p 0866c000 00:00 0 </i>
+<font color="#ff0000"><i>08c33000-08c34000 <b>r--p</b> 00624000 08:02 4891501    /usr/src/snort-2.8.1/src/snort</i></font>
+<i>08c34000-08df5000 rw-p 08c34000 00:00 0          [heap]</i></pre><p>
+When run with LD_BIND_NOW environment variable and our constructor
+function, Snort worked without any runtime issues. The interesting
+part about the technique is that it was done without any special
+dynamic linker support and does not use or depend on its '-z relro'
+option. Therefore the concept is technically 'portable' to another
+ELF based system that uses a different tool set without native
+protection mechanisms.<br><br><b>References</b> <br><br>Fedora
+Security Enhancements
+<a href="http://people.redhat.com/drepper/nonselsec.pdf">http://people.redhat.com/drepper/nonselsec.pdf</a><br>GCC
+Attributes
+<a href="http://www.ohse.de/uwe/articles/gcc-attributes.html">http://www.ohse.de/uwe/articles/gcc-attributes.html</a><br>Dynamic
+Linker Scripts <a href="http://sourceware.org/binutils/docs-2.18/ld/">http://sourceware.org/binutils/docs-2.18/ld/</a><br>RELRO
+Binutils <a href="http://sources.redhat.com/ml/binutils/2004-01/msg00070.html">http://sources.redhat.com/ml/binutils/2004-01/msg00070.html</a></p>
+<p><br><br><a href="http://em386.blogspot.com/">http://em386.blogspot.com</a><br><a href="http://www.structsoftware.com/">Struct
+Software</a> 
+</p>
+</body></html>
