@@ -1,6 +1,6 @@
 # Research, papers, slides
 
-I've published various white papers and slide decks over the years. THis is where they will live out their days...
+I've published various white papers and slide decks over the years. This is where they will live out their days...
 
 If you have any questions about the content of these please email me
 
